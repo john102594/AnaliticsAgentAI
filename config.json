@@ -1,0 +1,56 @@
+{
+    "descargas_dir": "descargas",
+    "db_url": "sqlite:///reportes.db",
+    "credentials": {
+        "usuario": "Admin",
+        "contraseña": "L1t0pl@$1967"
+    },
+    "server": {
+        "reports": [
+            {
+                "id": "reporteturno",
+                "name": "Novedades Produccion",
+                "url_pattern": "http://litoplas.info/reportes/19-Agente_Novedades_Turno/Nov_Turno_{turno}_{fecha}.xlsx",
+                "filename_pattern": "Novedades_Turno_{turno}_{fecha}.xlsx",
+                "sheet": "IMPRESION",
+                "sheets_to_process": ["CORTE", "IMPRESION", "EXTLAM", "LAMINACION", "SELLADO"]
+            },
+            {
+                "id": "desperdicios",
+                "name": "Desperdicios Turno",
+                "url_pattern": "http://litoplas.info/reportes/228-Desperdicios_Turno/Desperdicios_Turno_{turno}_{fecha}.xlsx",
+                "filename_pattern": "Desperdicios_Turno_{turno}_{fecha}.xlsx",
+                "sheet": "Desperdicio Liquidados Turno"
+            },
+            {
+                "id": "novedades",
+                "name": "Novedades Impresion",
+                "url_pattern": "http://litoplas.info/reportes/4-Novedades_Intranet_Impresion/Novedades_impresion_Intranet_Turno_{turno_padded}_{fecha}.xls",
+                "filename_pattern": "Novedades_impresion_Intranet_Turno_{turno_padded}_{fecha}.xls",
+                "sheet": "Resumen Operarios Imp."
+            },
+            {
+                "id": "tintas",
+                "name": "Consumo Tintas",
+                "url_pattern": "http://litoplas.info/reportes/76-Consumo%20Tintas%20Orden%20Finalizada%20Impresion/Consumo%20de%20tintas%20ordenes%20finalizadas%20en%20impresion_LP_{fecha}.xlsx",
+                "filename_pattern": "ConsumoTintas_{fecha}.xlsx",
+                "sheet": "Acumulado"
+            },
+            {
+                "id": "tpr",
+                "name": "Informe TP Restriccion",
+                "url_pattern": "http://litoplas.info/reportes/20-TPR/Informe_TP_Restriccion_LP_{fecha}.xlsx",
+                "filename_pattern": "Informe_TP_Restriccion_LP_{fecha}.xlsx",
+                "sheets_to_process": {
+                    "Detalle Corte": "corte",
+                    "Det Sellado": "sellado",
+                    "Det Laminacion": "laminacion",
+                    "Det Impresion": "impresion",
+                    "Detalle EXTLAM": "extlam",
+                    "Detalle Ext": "extrusion",
+                    "Detalle Montaje": "montaje"
+                }
+            }
+        ]
+    }
+}

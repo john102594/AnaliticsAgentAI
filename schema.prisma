@@ -1,0 +1,254 @@
+datasource db {
+  provider = "sqlite"
+  url      = "file:./reports.db"
+}
+
+generator client {
+  provider = "prisma-client-py"
+  interface = "sync"
+}
+
+model Novedad {
+  id        Int      @id @default(autoincrement())
+  fecha     String
+  turno     Int
+  maquina   String
+
+  // Novedad details
+  orden             String?
+  refer             String?
+  cump_horas        Float?
+  cump_metros       Float?
+  cump_t1_t4        Float?
+  kg_prod           Float?
+  kg_prog           Float?
+  mts_prod          Float?
+  mts_prog          Float?
+  desp_no_r_real    Float?
+  desp_no_r_std     Float?
+  mts_no_r_real     Float?
+  mts_no_r_std      Float?
+  desp_r_real       Float?
+  t1_real           Float?
+  t1_std            Float?
+  t2_real           Float?
+  t2_std            Float?
+  t3_real           Float?
+  t3_std            Float?
+  t4_real           Float?
+  t4_std            Float?
+  t5_real           Float?
+  t5_std            Float?
+  vel_real          Float?
+  vel_std           Float?
+  t_parada          Float?
+  num_parada        Float?
+  mts_por_bob_prod  Float?
+  kg_por_bob_prod   Float?
+  nro_bob_prod      Float?
+  t_total_real      Float?
+  t_total_std       Float?
+  productividad     Float?
+  paradas_std_t2    Float?
+  paradas_reales_t2 Float?
+  paradas_std_t3    Float?
+  paradas_reales_t3 Float?
+  paradas_std_t4    Float?
+  paradas_reales_t4 Float?
+  paradas_std_t5    Float?
+  paradas_reales_t5 Float?
+  paradas_std       Float?
+  paradas_reales    Float?
+
+  datos     String?
+  createdAt DateTime @default(now())
+
+  @@index([fecha, turno])
+}
+
+model Historico {
+  id        Int      @id @default(autoincrement())
+  fecha     String
+  turno     Int
+  maquina   String
+  proceso   String
+
+  // General Metrics
+  cump_horas             Float?
+  cump_metros            Float?
+  cump_desperdicio_pct   Float?
+  cump_productividad_pct Float?
+  prod_kg                Float?
+  prod_metros            Float?
+  mts_std                Float?
+  mts_cargue             Float?
+  kls_desperdicio        Float?
+
+  // Waste & Reject Metrics
+  desp_real_pct          Float?
+  desp_std_pct           Float?
+  rechazo_real_pct       Float?
+  kls_rechazo            Float?
+  kls_refile             Float? 
+  desperdicio            Float? 
+  std_desp               Float?
+  rechazos_kg            Float? 
+  rechazos_mts           Float? 
+  desp_r_real            Float? 
+  desp_pct               Float? 
+
+  // Variances and T-times
+  var_horas              Float? 
+  var_t1_t4              Float? 
+  var_t1                 Float?
+  var_t2                 Float?
+  var_t3                 Float?
+  var_t4                 Float?
+  var_t5                 Float?
+  
+  // Deltas Calculados por Turno
+  prod_kg_turno          Float?
+  prod_metros_turno      Float?
+  mts_std_turno          Float?
+  mts_cargue_turno       Float?
+  desperdicio_turno      Float?
+  std_desp_turno         Float?
+  rechazos_kg_turno      Float?
+  rechazos_mts_turno     Float?
+
+  t9                     Float?
+  t_sin_liq              Float? 
+
+  // original JSON data just in case
+  datos                  String?
+  createdAt              DateTime @default(now())
+
+  @@index([fecha, turno, proceso])
+}
+
+model Desperdicio {
+  id               Int      @id @default(autoincrement())
+  fecha            String
+  hora             String?
+  turno            Int?
+  proceso          String?
+  maquina          String?
+  bodega           String?
+  o_trabajo        String?
+  referencia       String?
+  item_silp        String?
+  descripcion      String?
+  kilos            Float?
+  usuario_registra String?
+  observacion      String?
+  kilos_rech       Float?
+  rechazado_por    String?
+  observ_rechz     String?
+  estado           String?
+  causal           String?
+
+  datos            String?
+  createdAt        DateTime @default(now())
+
+  @@index([fecha, turno, maquina])
+}
+
+model NovedadImpresionOT {
+  id               Int      @id @default(autoincrement())
+  fecha            String
+  turno            Int
+  maquina          String
+  
+  // Datos del Operario y Turno
+  operario         String?
+  reporte_nro      String?
+  
+  // Observaciones del turno asociadas a la Máquina
+  // Se insertarán en la 1ra OT de la máquina y la Última OT de la máquina
+  obs_inicial      String?  
+  obs_final        String?  
+  
+  // Datos de la OT (Eje central)
+  ot               String
+  referencia       String?
+  estado_ot        String?
+  
+  // Observaciones consolidadas de la OT
+  // Formato: "Variable T1: obs, DETALLE TS: causal tiempo area obs, METROS: obs"
+  observaciones    String?   
+  
+  // JSONs para guardar el detalle numérico de las sub-tablas
+  variables_t      String?   
+  detalle_ts       String?   
+  desperdicios     String?   
+  
+  // Totalizadores extraídos
+  total_desp_kilos  Float?
+  total_desp_metros Float?
+
+  createdAt        DateTime @default(now())
+
+  // Evitar duplicados si se procesa el mismo archivo
+  @@unique([fecha, turno, maquina, ot])
+}
+
+model ConsumoTintas {
+  id               Int      @id @default(autoincrement())
+  orden            String   @unique
+  referencia       String?
+  linea_financiera String?
+  kilos_tinta      Float?
+  valor_tintas     Float?
+  real_tintas_pct  Float?
+  kilos_impresos   Float?
+  metros_impresos  Float?
+  kls_std_tintas   Float?
+  mts_impreso_kg_std Float?
+  mts_impreso_kg_real Float?
+  dif_real_tin_vs_tin_ot Float?
+  dif_consumo_kls_st_pct Float?
+  kilt_real        Float?
+  kilt_std         Float?
+  kils_imp         Float?
+  kils_std         Float?
+  kild_imp         Float?
+  kild_std         Float?
+  mts_imp          Float?
+  mts_std          Float?
+  mtsd_imp         Float?
+  mtsd_std         Float?
+  cyrel            Float?
+
+  createdAt        DateTime @default(now())
+
+  @@index([orden])
+}
+
+model TPR {
+  id              Int      @id @default(autoincrement())
+  proceso         String
+  maquina         String?
+  fecha_reporte   String?
+  horas           Float?
+  causal          String?
+  tiempo          Float?
+  responsable     String?
+  orden           String?
+  referencia      String?
+  cliente         String?
+  usuario         String?
+  observaciones   String?
+  complejidad     String?
+  tiempo_2        Float?
+  ficha           String?
+  edicion         String?
+  cyrel           String?
+  etapa           String?
+
+  fecha_archivo   String?
+
+  datos           String?
+  createdAt       DateTime @default(now())
+
+  @@index([fecha_archivo, proceso])
+}

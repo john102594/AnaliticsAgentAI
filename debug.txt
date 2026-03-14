@@ -1,0 +1,34 @@
+                                                     0              1
+0         400060170 FILM PEPITO 25G 15C9G17M LS2 EXLAM              0
+1             400060387 FILM MANI JACKS 25G 30C20M LS2              0
+2   400060576 FLM DORITOS MEGAQ 150G 15C9G17M LS2 EXLA          83.33
+3                                                  NaN            NaN
+4                                               PCMC 3            NaN
+5                                                Refer  Cump.en Horas
+6                                   TIEMPO SIN PEDIDOS              0
+7                                                  NaN            NaN
+8                                              BOBST 5            NaN
+9                                                Refer  Cump.en Horas
+10           COMBO EL MUNDIAL MGTA 36G POLLOX3_LIMONX2             50
+11  400060576 FLM DORITOS MEGAQ 150G 15C9G17M LS2 EXLA              0
+12        82070 ROLLO TOSTACOS PICANTE 38G R2492 PLAXI              0
+13   400062715FLM CHOCLITOS LMON 27G 15C8G17MTR2 QT EL              0
+14                                                 NaN            NaN
+15                                     FISHER & KRECKE            NaN
+16                                               Refer  Cump.en Horas
+17  5326011 BBI LDPE X4R MEGA HI CAL 35M 202472 #25419              0
+18      K243483000 PL1 BT/BM 45.0X33.0 CK 360G REN COL              0
+19                                                 NaN            NaN
+20                                              PCMC 9            NaN
+21                                               Refer  Cump.en Horas
+22                                  TIEMPO SIN PEDIDOS              0
+23                                                 NaN            NaN
+24                                            BOBST 10            NaN
+25                                               Refer  Cump.en Horas
+26              ME02805  25X16.25TOZINETFRED 13G BS2.0              0
+27                     8070331 CRACKERS TOSH MIEL X3 F              0
+28                                                 NaN            NaN
+29                                          ROTOMEC 12            NaN
+30                                               Refer  Cump.en Horas
+31                                  TIEMPO SIN PEDIDOS              0
+32                                                 NaN            NaN

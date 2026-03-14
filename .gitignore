@@ -1,0 +1,11 @@
+/descargas
+.conda
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+venv/
+ENV/
+reports.db
+node_modules/
+.vscode/
