@@ -1,9 +1,16 @@
+"""
+Module for processing Excel production reports and synchronizing data with the database.
+
+This script extracts data from 'Novedades' and 'Históricos' Excel files, cleans and maps 
+the information, and saves it into the database using Prisma. It also includes 
+functionality to calculate production deltas between consecutive shifts.
+"""
 import os
-import glob
 import json
 import argparse
 import pandas as pd
 from prisma import Prisma
+from prisma.errors import PrismaError
 
 class ProcessReports:
     def __init__(self, config_path="config.json"):
@@ -235,226 +242,346 @@ class ProcessReports:
         return {k: v for k, v in mapped.items() if v is not None}
 
     # ---- PROCESAMIENTO PRINCIPAL ----
-    def procesar(self, fecha: str, turno: int):
-        self.db.connect()
+
+    def _calcular_fecha_turno_db(self, fecha: str, turno: int):
+        """Calcula la fecha y turno tal como se almacenan en la BD."""
+        turno_db = turno
+        fecha_db = fecha
+        if turno == 2:
+            dt_fecha = pd.to_datetime(fecha)
+            if dt_fecha.day == 1:
+                turno_db = 0
+            else:
+                fecha_db = (dt_fecha - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+        return fecha_db, turno_db
+
+    def parsear_excel(self, ruta_archivo: str, fecha: str, turno: int) -> dict:
+        """Fase 1 (thread-safe): lee el Excel y devuelve los datos listos para guardar.
+        
+        No toca la BD. Puede ejecutarse en paralelo desde múltiples threads.
+        Retorna un dict con 'fecha_db', 'turno_db', 'novedades' e 'historico'.
+        """
+        fecha_db, turno_db = self._calcular_fecha_turno_db(fecha, turno)
+
+        reports_cfg = self.config.get("server", {}).get("reports", [])
+        reporte_cfg = next((r for r in reports_cfg if r.get("id") == "reporteturno"), {})
+
+        resultado = {"fecha_db": fecha_db, "turno_db": turno_db, "novedades": [], "historico": {}}
+
+        # Abrir workbook UNA sola vez para todas las hojas
+        xl_file = pd.ExcelFile(ruta_archivo, engine="openpyxl")
+
+        # --- Parsear Novedades ---
+        hoja_novedades = reporte_cfg.get("sheet", "IMPRESION")
         try:
+            df_nov = xl_file.parse(sheet_name=hoja_novedades, header=None)
+            inicio_tabla, primera_maquina = self._find_table_start(df_nov)
+            fin_tabla = self._find_table_end(df_nov, inicio_tabla)
+            df_novedades_final = self._process_table_novedades(df_nov, inicio_tabla, fin_tabla, primera_maquina, fecha_db, turno_db)
+
+            for _, row in df_novedades_final.iterrows():
+                row_dict = row.to_dict()
+                maquina = str(row_dict.pop('Maquina', ''))
+                mapped_data = self._map_novedad_dict(row_dict)
+                create_data = {"fecha": fecha_db, "turno": turno_db, "maquina": maquina, "datos": json.dumps(row_dict)}
+                create_data.update(mapped_data)
+                resultado["novedades"].append(create_data)
+        except (KeyError, IndexError) as e:
+            print(f"  [WARN] Error parseando novedades en {ruta_archivo}: {e}")
+
+        # --- Parsear Histórico ---
+        hojas_historico = reporte_cfg.get("sheets_to_process", ["CORTE", "IMPRESION", "EXLAM", "LAMINACION"])
+        for sheet_name in hojas_historico:
+            try:
+                df_hist = xl_file.parse(sheet_name=sheet_name)
+                if df_hist.empty:
+                    continue
+                tabla_ext = self._extraer_tabla_historico(df_hist)
+                if tabla_ext is None:
+                    continue
+                if sheet_name == "IMPRESION":
+                    tabla_ext = tabla_ext.iloc[:, 1:]
+                tabla_limpia = self._limpiar_tabla_historico(tabla_ext, fecha_db, turno_db)
+
+                filas = []
+                for _, row in tabla_limpia.iterrows():
+                    row_dict = row.to_dict()
+                    maquina = str(row_dict.pop('Maquina', ''))
+                    mapped_data = self._map_historico_dict(row_dict)
+                    create_data = {"fecha": fecha_db, "turno": turno_db, "maquina": maquina, "proceso": sheet_name, "datos": json.dumps(row_dict)}
+                    create_data.update(mapped_data)
+                    filas.append(create_data)
+                resultado["historico"][sheet_name] = filas
+            except ValueError:
+                pass
+            except (KeyError, IndexError) as e:
+                print(f"  [WARN] Error parseando historico {sheet_name} en {ruta_archivo}: {e}")
+
+        return resultado
+
+    def guardar_datos(self, datos: dict, already_connected: bool = False):
+        """Fase 2 (secuencial): escribe los datos parseados a la BD.
+        
+        already_connected: si True, no hace connect/disconnect.
+        """
+        if not already_connected:
+            self.db.connect()
+        try:
+            fecha_db = datos["fecha_db"]
+            turno_db = datos["turno_db"]
+
+            # --- Guardar Novedades ---
+            existentes_nov = self.db.novedad.find_many(where={"fecha": fecha_db, "turno": turno_db})
+            used_nov_ids = set()
+            count_nov_created = count_nov_updated = 0
+
+            for create_data in datos["novedades"]:
+                maquina = create_data["maquina"]
+                assigned_id = next((ex.id for ex in existentes_nov if ex.maquina == maquina and ex.id not in used_nov_ids), None)
+                if assigned_id:
+                    used_nov_ids.add(assigned_id)
+                    upd = {k: v for k, v in create_data.items() if k not in ("fecha", "turno", "maquina")}
+                    self.db.novedad.update(where={"id": assigned_id}, data=upd)
+                    count_nov_updated += 1
+                else:
+                    self.db.novedad.create(data=create_data)
+                    count_nov_created += 1
+
+            count_nov_deleted = sum(1 for ex in existentes_nov if ex.id not in used_nov_ids and not self.db.novedad.delete(where={"id": ex.id}))
+            print(f"  Novedades: {count_nov_created} creados, {count_nov_updated} actualizados, {count_nov_deleted} eliminados.")
+
+            # --- Guardar Histórico ---
+            for sheet_name, filas in datos["historico"].items():
+                existentes_hist = self.db.historico.find_many(where={"fecha": fecha_db, "turno": turno_db, "proceso": sheet_name})
+                used_hist_ids = set()
+                count_hist_created = count_hist_updated = 0
+
+                for create_data in filas:
+                    maquina = create_data["maquina"]
+                    assigned_id = next((ex.id for ex in existentes_hist if ex.maquina == maquina and ex.id not in used_hist_ids), None)
+                    if assigned_id:
+                        used_hist_ids.add(assigned_id)
+                        upd = {k: v for k, v in create_data.items() if k not in ("fecha", "turno", "maquina", "proceso")}
+                        self.db.historico.update(where={"id": assigned_id}, data=upd)
+                        count_hist_updated += 1
+                    else:
+                        self.db.historico.create(data=create_data)
+                        count_hist_created += 1
+
+                count_hist_deleted = 0
+                for ex in existentes_hist:
+                    if ex.id not in used_hist_ids:
+                        self.db.historico.delete(where={"id": ex.id})
+                        count_hist_deleted += 1
+                print(f"  Histórico {sheet_name}: {count_hist_created} creados, {count_hist_updated} actualizados, {count_hist_deleted} eliminados.")
+        finally:
+            if not already_connected:
+                self.db.disconnect()
+
+    def procesar(self, fecha: str, turno: int, already_connected: bool = False):
+        """Procesa un archivo Excel hacia la BD (compatibilidad con uso individual).
+        
+        Para procesamiento masivo, usar parsear_excel() + guardar_datos() por separado.
+        """
+        if not already_connected:
+            self.db.connect()
+        try:
+            fecha_db, turno_db = self._calcular_fecha_turno_db(fecha, turno)
             fecha_url = fecha.replace("-", "")
+            patron_archivo = f"Novedades_Turno_{turno}_{fecha_url}.xlsx"
+
+            # Skip si ya existe
+            ya_existe = self.db.historico.find_first(where={"fecha": fecha_db, "turno": turno_db})
+            if ya_existe:
+                print(f"  [SKIP] {patron_archivo} ya en BD ({fecha_db} T{turno_db}).")
+                return True
+
             script_dir = os.path.dirname(os.path.abspath(__file__))
             descargas_dir = os.path.join(script_dir, self.config.get("descargas_dir", "descargas"), "reporteturno")
-            
-            # Buscamos el archivo en descargas
-            patron_archivo = f"Novedades_Turno_{turno}_{fecha_url}.xlsx"
             ruta_archivo = os.path.join(descargas_dir, patron_archivo)
-            
+
             if not os.path.exists(ruta_archivo):
                 print(f"Archivo no encontrado: {ruta_archivo}")
                 return
-                
+
             print(f"Procesando: {ruta_archivo}")
-            
-            # Ajuste de fecha para DB: Turno 2 se registra con fecha del dia anterior
-            orig_fecha = fecha
-            orig_turno = turno
-            if turno == 2:
-                dt_fecha = pd.to_datetime(fecha)
-                if dt_fecha.day == 1:
-                    turno = 0
-                else:
-                    fecha = (dt_fecha - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-            
-            # Buscar config reporteturno
-            reports_cfg = self.config.get("server", {}).get("reports", [])
-            reporte_cfg = next((r for r in reports_cfg if r.get("id") == "reporteturno"), {})
-            
-            # --- Procesar Novedades
-            hoja_novedades = reporte_cfg.get("sheet", "IMPRESION")
-            try:
-                df_nov = pd.read_excel(ruta_archivo, sheet_name=hoja_novedades, header=None, engine="openpyxl")
-                inicio_tabla, primera_maquina = self._find_table_start(df_nov)
-                fin_tabla = self._find_table_end(df_nov, inicio_tabla)
-                
-                df_novedades_final = self._process_table_novedades(df_nov, inicio_tabla, fin_tabla, primera_maquina, fecha, turno)
-                
-                existentes_nov = self.db.novedad.find_many(where={"fecha": fecha, "turno": turno})
-                used_nov_ids = set()
-                
-                count_nov_created = 0
-                count_nov_updated = 0
-                
-                for _, row in df_novedades_final.iterrows():
-                    row_dict = row.to_dict()
-                    maquina = str(row_dict.pop('Maquina', ''))
-                    
-                    mapped_data = self._map_novedad_dict(row_dict)
-                    create_data = {
-                        "fecha": fecha,
-                        "turno": turno,
-                        "maquina": maquina,
-                        "datos": json.dumps(row_dict)
-                    }
-                    create_data.update(mapped_data)
-                    
-                    assigned_id = None
-                    for ex in existentes_nov:
-                        if ex.maquina == maquina and ex.id not in used_nov_ids:
-                            assigned_id = ex.id
-                            used_nov_ids.add(ex.id)
-                            break
-                    
-                    if assigned_id:
-                        update_data = create_data.copy()
-                        del update_data["fecha"]
-                        del update_data["turno"]
-                        del update_data["maquina"]
-                        self.db.novedad.update(where={"id": assigned_id}, data=update_data)
-                        count_nov_updated += 1
-                    else:
-                        self.db.novedad.create(data=create_data)
-                        count_nov_created += 1
-                
-                count_nov_deleted = 0
-                for ex in existentes_nov:
-                    if ex.id not in used_nov_ids:
-                        self.db.novedad.delete(where={"id": ex.id})
-                        count_nov_deleted += 1
-                        
-                print(f"Novedades: {count_nov_created} creados, {count_nov_updated} actualizados, {count_nov_deleted} eliminados.")
-            except Exception as e:
-                print(f"Error procesando novedades: {e}")
-
-            # --- Procesar Historico (SIN CALCULAR DELTAS EN ESTE PASO)
-            hojas_historico = reporte_cfg.get("sheets_to_process", ["CORTE", "IMPRESION", "EXLAM", "LAMINACION"])
-            
-            for sheet_name in hojas_historico:
-                try:
-                    df_hist = pd.read_excel(ruta_archivo, sheet_name=sheet_name, engine="openpyxl")
-                    if df_hist.empty:
-                        continue
-                        
-                    tabla_ext = self._extraer_tabla_historico(df_hist)
-                    if tabla_ext is None:
-                        continue
-                        
-                    if sheet_name == "IMPRESION":
-                        tabla_ext = tabla_ext.iloc[:, 1:]
-                        
-                    tabla_limpia = self._limpiar_tabla_historico(tabla_ext, fecha, turno)
-                    
-                    existentes_hist = self.db.historico.find_many(where={
-                        "fecha": fecha, 
-                        "turno": turno,
-                        "proceso": sheet_name
-                    })
-                    used_hist_ids = set()
-                    
-                    count_hist_created = 0
-                    count_hist_updated = 0
-                    
-                    for _, row in tabla_limpia.iterrows():
-                        row_dict = row.to_dict()
-                        maquina = str(row_dict.pop('Maquina', ''))
-                        
-                        mapped_data = self._map_historico_dict(row_dict)
-                        
-                        create_data = {
-                            "fecha": fecha,
-                            "turno": turno,
-                            "maquina": maquina,
-                            "proceso": sheet_name,
-                            "datos": json.dumps(row_dict)
-                        }
-                        create_data.update(mapped_data)
-                        
-                        assigned_id = None
-                        for ex in existentes_hist:
-                            if ex.maquina == maquina and ex.id not in used_hist_ids:
-                                assigned_id = ex.id
-                                used_hist_ids.add(ex.id)
-                                break
-                                
-                        if assigned_id:
-                            update_data = create_data.copy()
-                            del update_data["fecha"]
-                            del update_data["turno"]
-                            del update_data["maquina"]
-                            del update_data["proceso"]
-                            self.db.historico.update(where={"id": assigned_id}, data=update_data)
-                            count_hist_updated += 1
-                        else:
-                            self.db.historico.create(data=create_data)
-                            count_hist_created += 1
-                            
-                    count_hist_deleted = 0
-                    for ex in existentes_hist:
-                        if ex.id not in used_hist_ids:
-                            self.db.historico.delete(where={"id": ex.id})
-                            count_hist_deleted += 1
-                            
-                    print(f"Histórico {sheet_name}: {count_hist_created} creados, {count_hist_updated} actualizados, {count_hist_deleted} eliminados.")
-                except ValueError:
-                    pass
-                except Exception as e:
-                    print(f"Error procesando historico en {sheet_name}: {e}")
-
+            datos = self.parsear_excel(ruta_archivo, fecha, turno)
+            self.guardar_datos(datos, already_connected=True)
         finally:
-            self.db.disconnect()
+            if not already_connected:
+                self.db.disconnect()
 
-    def post_procesar_deltas(self, fecha_desde: str):
-        """Calcula y actualiza los deltas por turno para todos los registros desde una fecha."""
+
+
+
+    def post_procesar_deltas(self, fecha_desde: str, fecha_hasta: str = None):
+        """Calcula los deltas por turno. La suma de deltas del mes es igual al acumulado del último T1 del mes."""
+
         self.db.connect()
         try:
-            print(f"--- Calculando deltas desde {fecha_desde} ---")
-            
-            # Obtener todos los registros desde la fecha para recalculas deltas
-            todos = self.db.historico.find_many(
-                where={"fecha": {"gte": fecha_desde}},
-                order=[{"fecha": "asc"}, {"turno": "asc"}]
+            msg = f"--- Iniciando cálculo de deltas desde {fecha_desde}"
+            if fecha_hasta:
+                msg += f" hasta {fecha_hasta}"
+            msg += " ---"
+            print(msg)
+
+            # Construir la clausula where
+            where_clause = {"fecha": {"gte": fecha_desde}}
+            if fecha_hasta:
+                where_clause["fecha"]["lte"] = fecha_hasta
+
+            # Obtener registros ordenados por maquina, proceso y tiempo
+            records = self.db.historico.find_many(
+                where=where_clause,
+                order=[
+                    {"maquina": "asc"},
+                    {"proceso": "asc"},
+                    {"fecha": "asc"},
+                    {"turno": "asc"}
+                ]
             )
-            
+
+            print(f"Procesando {len(records)} registros...")
+
             def _calc_delta(curr, prev):
                 if curr is None: return 0.0
-                if prev is None: return curr
-                return max(curr - prev, 0.0)
+                if prev is None: return float(curr)
+                return max(float(curr) - float(prev), 0.0)
 
-            for item in todos:
-                # Buscar el registro inmediatamente anterior para MISMA MAQUINA y MISMO PROCESO
-                prev = self.db.historico.find_first(
-                    where={
-                        "maquina": item.maquina,
-                        "proceso": item.proceso,
-                        "OR": [
-                            {"fecha": {"lt": item.fecha}},
-                            {"AND": [{"fecha": item.fecha}, {"turno": {"lt": item.turno}}]}
-                        ]
-                    },
-                    order=[{"fecha": "desc"}, {"turno": "desc"}]
-                )
-                
-                # Si es el primer reporte absoluto del mes (dia 1 turno 0), no restamos nada.
-                # El Turno 1 del Dia 1 SI debe restar del Turno 0 del Dia 1.
-                dt = pd.to_datetime(item.fecha)
-                es_inicio_absoluto_mes = dt.day == 1 and item.turno == 0
-                
-                if es_inicio_absoluto_mes:
-                    prev = None
+            # Campos cumulativos y sus campos de delta correspondientes
+            FIELDS = {
+                "prod_kg":      "prod_kg_turno",
+                "prod_metros":  "prod_metros_turno",
+                "mts_std":      "mts_std_turno",
+                "mts_cargue":   "mts_cargue_turno",
+                "desperdicio":  "desperdicio_turno",
+                "std_desp":     "std_desp_turno",
+                "rechazos_kg":  "rechazos_kg_turno",
+                "rechazos_mts": "rechazos_mts_turno",
+            }
 
-                deltas = {
-                    "prod_kg_turno": _calc_delta(item.prod_kg, prev.prod_kg if prev else 0),
-                    "prod_metros_turno": _calc_delta(item.prod_metros, prev.prod_metros if prev else 0),
-                    "mts_std_turno": _calc_delta(item.mts_std, prev.mts_std if prev else 0),
-                    "mts_cargue_turno": _calc_delta(item.mts_cargue, prev.mts_cargue if prev else 0),
-                    "desperdicio_turno": _calc_delta(item.desperdicio, prev.desperdicio if prev else 0),
-                    "std_desp_turno": _calc_delta(item.std_desp, prev.std_desp if prev else 0),
-                    "rechazos_kg_turno": _calc_delta(item.rechazos_kg, prev.rechazos_kg if prev else 0),
-                    "rechazos_mts_turno": _calc_delta(item.rechazos_mts, prev.rechazos_mts if prev else 0),
-                }
-                
-                self.db.historico.update(where={"id": item.id}, data=deltas)
-            
+            # Agrupar por (maquina, proceso) y procesar mes a mes en memoria
+            from itertools import groupby
+            from operator import attrgetter
+
+            # Ordenar también por fecha/turno para el groupby
+            for (maquina, proceso), group in groupby(records, key=lambda r: (r.maquina, r.proceso)):
+                group_list = list(group)
+
+                # Sub-agrupar por mes/año
+                def get_month_key(r):
+                    dt = pd.to_datetime(r.fecha)
+                    return (dt.year, dt.month)
+
+                for month_key, month_group in groupby(group_list, key=get_month_key):
+                    month_records = list(month_group)
+                    
+                    # Buscar en DB el último registro del mes ANTERIOR para este grupo
+                    # para poder caluclar el delta del primer turno del mes
+                    first = month_records[0]
+                    dt_first = pd.to_datetime(first.fecha)
+                    
+                    prev_month_record = self.db.historico.find_first(
+                        where={
+                            "maquina": maquina,
+                            "proceso": proceso,
+                            "OR": [
+                                {"fecha": {"lt": first.fecha}},
+                                {"AND": [{"fecha": first.fecha}, {"turno": {"lt": first.turno}}]}
+                            ]
+                        },
+                        order=[{"fecha": "desc"}, {"turno": "desc"}]
+                    )
+                    
+                    # Verificar que el registro anterior sea del MES anterior (no del mismo)
+                    if prev_month_record:
+                        dt_prev = pd.to_datetime(prev_month_record.fecha)
+                        if dt_prev.year == dt_first.year and dt_prev.month == dt_first.month:
+                            prev_month_record = None  # mismo mes, no reiniciar
+                    
+                    # REGLA: El T1 del último día del mes es el acumulado total del mes.
+                    # El T2 del último día se toma como T0 del mes siguiente (no forma parte de este mes).
+                    # Por eso, solo procesamos T0 y T1 del mes.
+                    # Filtramos T2 del último día del mes (estos NO se cuentan en el mes actual)
+                    last_day = max(pd.to_datetime(r.fecha).day for r in month_records)
+                    month_records_filtered = [
+                        r for r in month_records
+                        if not (pd.to_datetime(r.fecha).day == last_day and r.turno == 2)
+                    ]
+
+                    prev = prev_month_record
+
+                    for idx, item in enumerate(month_records_filtered):
+                        # Obtener los valores acumulados del registro actual
+                        curr_vals = {f: (float(getattr(item, f)) if getattr(item, f) is not None else 0.0) for f in FIELDS}
+                        prev_vals = {f: (float(getattr(prev, f)) if prev and getattr(prev, f) is not None else None) for f in FIELDS}
+
+                        # Detectar si el siguiente registro (mismo mes) tiene valores MENORES para mts_std
+                        # Si es así, el actual es un pico erróneo
+                        next_item = None
+                        if idx + 1 < len(month_records_filtered):
+                            next_item = month_records_filtered[idx + 1]
+                        next_vals = {f: (float(getattr(next_item, f)) if next_item and getattr(next_item, f) is not None else None) for f in FIELDS}
+
+                        # Detección de anomalía de duplicidad (>600k en IMPRESION)
+                        # Solo usamos los valores escalados para calcular el delta.
+                        # NUNCA reescribimos los valores acumulados originales en la BD.
+                        curr_mts_eff = curr_vals["prod_metros"]
+                        prev_mts_eff = prev_vals["prod_metros"]
+                        temp_delta_mts = _calc_delta(curr_mts_eff, prev_mts_eff)
+
+                        scale = 1.0
+                        if item.proceso == "IMPRESION" and temp_delta_mts > 600000:
+                            print(f"  [DUP] Maquina {item.maquina} ({item.fecha} T{item.turno}): delta {temp_delta_mts:.0f} mts. Usando / 2 solo para delta.")
+                            scale = 2.0
+
+                        # Valores efectivos (escalados en memoria, jamás se guardan en la BD)
+                        curr_eff = {f: v / scale for f, v in curr_vals.items()}
+
+                        # El T0 del día 1 del mes es el T2 del último día del mes anterior (carryover).
+                        # Para este registro, el "drop" hacia el siguiente turno es ESPERADO (el mes nuevo
+                        # empieza a acumular desde ese baseline). NO aplicar detección de picos en este caso.
+                        dt_item = pd.to_datetime(item.fecha)
+                        is_carryover_t0 = (dt_item.day == 1 and item.turno == 0)
+
+                        if is_carryover_t0:
+                            # T0 día 1: el agente ya viene reiniciado desde el xlsx (ej. 120,000 mts).
+                            # El acumulado de este turno ES su propio delta (no hay anterior en el mes nuevo).
+                            # Tratamos prev como None → delta = curr_val directamente.
+                            prev_vals = {f: None for f in FIELDS}
+
+                        deltas = {}
+                        prev_eff_next = {}  # valores "prev" para el siguiente turno, por campo
+
+                        for cum_field, delta_field in FIELDS.items():
+                            c_val = curr_eff[cum_field]
+                            p_val = prev_vals[cum_field]
+                            n_val = next_vals.get(cum_field)
+
+                            # Pico detectado: el valor actual es mayor al siguiente dentro del mismo mes.
+                            is_peak = (n_val is not None and c_val > n_val)
+
+                            if is_peak:
+                                # Delta = 0 para este turno, y no avanzamos el prev para este campo
+                                deltas[delta_field] = 0.0
+                                prev_eff_next[cum_field] = p_val if p_val is not None else 0.0
+                            else:
+                                deltas[delta_field] = _calc_delta(c_val, p_val)
+                                prev_eff_next[cum_field] = c_val
+
+                        self.db.historico.update(where={"id": item.id}, data=deltas)
+
+                        # Avanzar prev con los valores efectivos calculados (en memoria, sin tocar DB)
+                        class _PrevProxy:
+                            pass
+                        prev_proxy = _PrevProxy()
+                        for f, v in prev_eff_next.items():
+                            setattr(prev_proxy, f, v)
+                        prev = prev_proxy
+
             print("Cálculo de deltas finalizado.")
         finally:
             self.db.disconnect()
-
 
 
 def main():

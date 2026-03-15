@@ -1,3 +1,8 @@
-UPDATE sqlite_sequence
-SET seq = 0
-WHERE name = 'Tpr';
+SELECT proceso,
+  maquina,
+  prod_metros_turno,
+  fecha,
+  turno
+FROM Historico
+WHERE Fecha = "2026-03-11"
+  AND turno = 2

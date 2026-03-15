@@ -1,0 +1,14 @@
+{
+  "name": "analitics-agent-ai",
+  "version": "1.0.0",
+  "description": "Herramientas de análisis con Prisma y Python",
+  "devDependencies": {
+    "prisma": "^7.5.0"
+  },
+  "scripts": {
+    "db:generate": "prisma generate",
+    "db:push": "prisma db push",
+    "db:studio": "prisma studio",
+    "db:format": "prisma format"
+  }
+}

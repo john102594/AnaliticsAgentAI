@@ -1,5 +1,6 @@
 requests
 urllib3
 pandas
-prisma
-openpyxl
+prisma==0.15.0
+openpyxl==3.1.5
+xlrd==2.0.2
