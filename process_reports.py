@@ -441,7 +441,18 @@ class ProcessReports:
                 ]
             )
 
-            print(f"Procesando {len(records)} registros...")
+            total = len(records)
+            print(f"Procesando {total} registros...")
+            grupos_maq_proc = set((r.maquina, r.proceso) for r in records)
+            print(f"  {len(grupos_maq_proc)} combinaciones máquina+proceso encontradas.")
+
+            # Acumular todos los deltas en memoria para hacer un solo bulk update al final
+            import sqlite3 as _sqlite3
+            import os as _os
+            delta_field_names = ["prod_kg_turno", "prod_metros_turno", "mts_std_turno",
+                                 "mts_cargue_turno", "desperdicio_turno", "std_desp_turno",
+                                 "rechazos_kg_turno", "rechazos_mts_turno"]
+            all_deltas = []  # lista de (id, val1, val2, ...) para executemany
 
             def _calc_delta(curr, prev):
                 if curr is None: return 0.0
@@ -465,8 +476,12 @@ class ProcessReports:
             from operator import attrgetter
 
             # Ordenar también por fecha/turno para el groupby
+            num_grupos = len(grupos_maq_proc)
+            grupo_idx = 0
             for (maquina, proceso), group in groupby(records, key=lambda r: (r.maquina, r.proceso)):
                 group_list = list(group)
+                grupo_idx += 1
+                print(f"[{grupo_idx}/{num_grupos}] {proceso} | Maq {maquina} ({len(group_list)} registros)")
 
                 # Sub-agrupar por mes/año
                 def get_month_key(r):
@@ -475,6 +490,7 @@ class ProcessReports:
 
                 for month_key, month_group in groupby(group_list, key=get_month_key):
                     month_records = list(month_group)
+                    print(f"  Mes {month_key[0]}-{month_key[1]:02d}: {len(month_records)} turnos")
                     
                     # Buscar en DB el último registro del mes ANTERIOR para este grupo
                     # para poder caluclar el delta del primer turno del mes
@@ -524,16 +540,31 @@ class ProcessReports:
                         next_vals = {f: (float(getattr(next_item, f)) if next_item and getattr(next_item, f) is not None else None) for f in FIELDS}
 
                         # Detección de anomalía de duplicidad (>600k en IMPRESION)
-                        # Solo usamos los valores escalados para calcular el delta.
-                        # NUNCA reescribimos los valores acumulados originales en la BD.
+                        # IMPORTANTE: solo aplica si NO hay turnos faltantes entre prev y actual.
+                        # Si hay un gap de días (archivos sin procesar), la delta alta es producción
+                        # acumulada legítima, NOT una duplicación del contador.
                         curr_mts_eff = curr_vals["prod_metros"]
                         prev_mts_eff = prev_vals["prod_metros"]
                         temp_delta_mts = _calc_delta(curr_mts_eff, prev_mts_eff)
 
+                        # Calcular turnos esperados entre prev y este registro
+                        turnos_gap = 1  # asumir turno consecutivo por defecto
+                        if prev:
+                            dt_prev = pd.to_datetime(prev.fecha)
+                            dt_curr = pd.to_datetime(item.fecha)
+                            dias_diff = (dt_curr - dt_prev).days
+                            # Turnos entre prev y curr (cada día tiene T1 y T2, más T0 del 1ro de mes)
+                            turnos_gap = max(1, dias_diff * 2 + abs(item.turno - getattr(prev, 'turno', 1)))
+
+                        # Solo aplicar corrección DUP si la delta NO se explica por el gap de turnos.
+                        # Umbral ajustado: 600k por turno faltante (si hay 3 turnos faltantes → 1.8M sería el límite)
+                        umbral_dup = 600000 * max(1, turnos_gap)
                         scale = 1.0
-                        if item.proceso == "IMPRESION" and temp_delta_mts > 600000:
-                            print(f"  [DUP] Maquina {item.maquina} ({item.fecha} T{item.turno}): delta {temp_delta_mts:.0f} mts. Usando / 2 solo para delta.")
+                        if item.proceso == "IMPRESION" and temp_delta_mts > umbral_dup:
+                            print(f"  [DUP] Maquina {item.maquina} ({item.fecha} T{item.turno}): "
+                                  f"delta {temp_delta_mts:.0f} mts (gap={turnos_gap} turnos, umbral={umbral_dup:.0f}). Usando / 2.")
                             scale = 2.0
+
 
                         # Valores efectivos (escalados en memoria, jamás se guardan en la BD)
                         curr_eff = {f: v / scale for f, v in curr_vals.items()}
@@ -569,7 +600,18 @@ class ProcessReports:
                                 deltas[delta_field] = _calc_delta(c_val, p_val)
                                 prev_eff_next[cum_field] = c_val
 
-                        self.db.historico.update(where={"id": item.id}, data=deltas)
+                        # Acumular el delta para escritura bulk posterior
+                        all_deltas.append((
+                            deltas.get("prod_kg_turno"),
+                            deltas.get("prod_metros_turno"),
+                            deltas.get("mts_std_turno"),
+                            deltas.get("mts_cargue_turno"),
+                            deltas.get("desperdicio_turno"),
+                            deltas.get("std_desp_turno"),
+                            deltas.get("rechazos_kg_turno"),
+                            deltas.get("rechazos_mts_turno"),
+                            item.id,
+                        ))
 
                         # Avanzar prev con los valores efectivos calculados (en memoria, sin tocar DB)
                         class _PrevProxy:
@@ -577,9 +619,24 @@ class ProcessReports:
                         prev_proxy = _PrevProxy()
                         for f, v in prev_eff_next.items():
                             setattr(prev_proxy, f, v)
+                        # Guardar fecha y turno del registro actual para calcular gaps en la siguiente iteración
+                        prev_proxy.fecha = item.fecha
+                        prev_proxy.turno = item.turno
                         prev = prev_proxy
 
-            print("Cálculo de deltas finalizado.")
+
+            # --- Bulk update en una sola transacción SQLite ---
+            db_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "reports.db")
+            sql = """UPDATE Historico SET
+                prod_kg_turno=?, prod_metros_turno=?, mts_std_turno=?,
+                mts_cargue_turno=?, desperdicio_turno=?, std_desp_turno=?,
+                rechazos_kg_turno=?, rechazos_mts_turno=?
+                WHERE id=?"""
+            print(f"  Escribiendo {len(all_deltas)} deltas a BD en bulk...")
+            with _sqlite3.connect(db_path) as conn:
+                conn.executemany(sql, all_deltas)
+                conn.commit()
+            print(f"Cálculo de deltas finalizado. {len(all_deltas)} registros actualizados de {total} procesados.")
         finally:
             self.db.disconnect()
 
