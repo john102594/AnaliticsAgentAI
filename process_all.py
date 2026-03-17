@@ -141,14 +141,16 @@ def process_novedades_produccion():
         processor.db.disconnect()
 
 
-    # Post-procesamiento de deltas
+    # Post-procesamiento de deltas — solo para el rango de fechas procesadas
     if fechas_procesadas:
         fecha_minima = min(fechas_procesadas)
-        print(f"\nIniciando cálculo de deltas desde {fecha_minima}...")
+        fecha_maxima = max(fechas_procesadas)
+        print(f"\nIniciando cálculo de deltas de {fecha_minima} a {fecha_maxima}...")
         try:
-            processor.post_procesar_deltas(fecha_minima)
+            processor.post_procesar_deltas(fecha_minima, fecha_hasta=fecha_maxima)
         except Exception as e:
             print(f"Error calculando deltas: {e}")
+
 
 
 
