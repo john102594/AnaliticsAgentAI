@@ -9,3 +9,4 @@ ENV/
 node_modules/
 .vscode/
 reports.db
+reports.db-journal
